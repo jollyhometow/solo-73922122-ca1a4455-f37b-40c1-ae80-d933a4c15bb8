@@ -56,6 +56,32 @@ CREATE TABLE IF NOT EXISTS store_meta (
     generation  INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO store_meta(id, generation) VALUES (1, 0);
+
+-- Monotonic per-point mutation counter.  Unlike comparing coordinates, this
+-- detects a later correction that happens to write the old value back, and
+-- also survives a delete/recreate cycle because the counter row is not
+-- removed with the point.
+CREATE TABLE IF NOT EXISTS point_versions (
+    point_id    TEXT PRIMARY KEY,
+    version     INTEGER NOT NULL
+);
+-- Backfill legacy rows created before version tracking existed.
+INSERT OR IGNORE INTO point_versions(point_id, version)
+    SELECT id, 1 FROM points;
+
+-- Successful batches that only corrected the coordinates of already existing
+-- points.  `points` is a JSON array of
+--   {"id": ..., "lon": <original>, "lat": <original>, "version": <captured>}
+-- where `version` is the point's counter *after* the batch committed.  The
+-- batch is still withdrawable only while every point still has exactly that
+-- version.
+CREATE TABLE IF NOT EXISTS point_rollbacks (
+    batch_id           TEXT PRIMARY KEY,
+    created_at         TEXT NOT NULL,
+    withdrawn_at       TEXT,
+    affected_road_ids  TEXT NOT NULL DEFAULT '[]',
+    points             TEXT NOT NULL
+);
 """
 
 

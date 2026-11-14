@@ -118,6 +118,22 @@ class BatchIn(BaseModel):
     roads: list[RoadIn] = Field(default_factory=list, description="新增或更正路段（引用变更即改线）")
     delete_points: list[str] = Field(default_factory=list, description="删除测点（引用它的路段转为 incomplete 或随之恢复）")
     delete_roads: list[str] = Field(default_factory=list, description="删除路段及其引用")
+    batch_id: str | None = Field(
+        default=None,
+        max_length=64,
+        description="可选：调用方指定的批次 ID。仅当本批次是“只更正已有测点坐标”时可撤回；"
+        "不指定时由服务端生成并在响应中返回。",
+    )
+
+    @field_validator("batch_id")
+    @classmethod
+    def _clean_batch_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("batch_id must not be blank")
+        return v
 
     @field_validator("delete_points", "delete_roads")
     @classmethod
@@ -142,6 +158,10 @@ class BatchIn(BaseModel):
 
 
 class BatchResult(BaseModel):
+    batch_id: str = Field(description="批次 ID；若本批次可撤回（只更正已有测点坐标），撤回时使用它")
+    withdrawable: bool = Field(
+        description="本批次是否已登记撤回记录（仅当只更正了已有测点的坐标且提交成功）"
+    )
     points_upserted: int = Field(description="本批次实际写入（新增或坐标变化）的测点数")
     roads_upserted: int = Field(description="本批次新建的路段数")
     roads_updated: int = Field(description="本批次重算并更新线形/缺项/引用的已有路段数")
@@ -186,4 +206,48 @@ class HealthResponse(BaseModel):
     journal_mode: str
 
 
+class RollbackPointOut(BaseModel):
+    id: str
+    lon: float = Field(description="撤回时应恢复的原始经度")
+    lat: float = Field(description="撤回时应恢复的原始纬度")
+    current_lon: float | None = Field(description="当前经度；测点已被删除/重建后为 null")
+    current_lat: float | None = Field(description="当前纬度；测点已被删除/重建后为 null")
+    withdrawable: bool = Field(description="该测点自本批次之后是否未被其他批次改动")
+
+
+class WithdrawConflictOut(BaseModel):
+    """409 body: the whole batch is refused and nothing is modified."""
+
+    detail: str
+    batch_id: str
+    conflicts: list[dict] = Field(
+        description="导致拒绝的测点及原因（modified_since_batch / deleted_or_missing）"
+    )
+
+
+class RollbackRecordOut(BaseModel):
+    batch_id: str
+    created_at: str
+    withdrawn_at: str | None = Field(description="撤回成功时间；null 表示尚未撤回")
+    affected_road_ids: list[str] = Field(
+        default_factory=list, description="撤回时重算过的路段 ID（仅撤回后非空）"
+    )
+    points: list[RollbackPointOut]
+
+
+class WithdrawResult(BaseModel):
+    batch_id: str
+    withdrawn_at: str = Field(description="撤回生效时间")
+    points_restored: int = Field(
+        description="本次恢复原坐标的测点数；重复撤回时为 0（不再修改数据）"
+    )
+    affected_road_ids: list[str] = Field(description="按恢复后的坐标重算并持久化的全部当前引用路段 ID")
+    roads: list["RoadOut"] = Field(description="重算后这些路段的最终持久状态，按 ID 升序")
+    already_withdrawn: bool = Field(
+        default=False, description="true 表示该批次此前已撤回成功，本次未修改任何数据"
+    )
+    commit_attempts: int = Field(default=1, description="提交尝试次数")
+
+
 BatchResult.model_rebuild()
+WithdrawResult.model_rebuild()

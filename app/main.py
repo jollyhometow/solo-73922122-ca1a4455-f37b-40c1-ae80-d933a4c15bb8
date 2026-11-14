@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 
 from . import store
 from .config import settings
@@ -17,7 +18,10 @@ from .schemas import (
     PointsResponse,
     RoadOut,
     RoadsResponse,
+    RollbackRecordOut,
     StateResponse,
+    WithdrawConflictOut,
+    WithdrawResult,
 )
 
 DESCRIPTION = """
@@ -30,6 +34,9 @@ DESCRIPTION = """
   的测点 ID；补齐测点后下一次批次自动恢复线形。
 * 测点更正/删除、路段引用变更会影响的所有路段在同一事务内整批重算，
   失败整体回滚，数据库保持原状。
+* 只更正**已有测点坐标**的成功批次会登记批次 ID 与原坐标；可用
+  `POST /api/v1/batches/{batch_id}/withdraw` 整批撤回，恢复原坐标并按恢复后
+  的坐标重算**当前**引用这些测点的全部路段。
 * `GET /api/v1/state` 在**一个读快照**里返回全部测点原值与已持久化线形，
   不会出现"新坐标 + 旧线形"的混合视图。
 
@@ -84,9 +91,72 @@ def post_batch(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except store.DemoFailure as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except store.DuplicateBatchId as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch_id {exc.args[0]!r} already identifies a recorded batch",
+        ) from exc
     except sqlite3.OperationalError as exc:
         raise HTTPException(status_code=503, detail=f"database busy: {exc}") from exc
     return result
+
+
+@app.post(
+    "/api/v1/batches/{batch_id}/withdraw",
+    response_model=WithdrawResult,
+    responses={409: {"model": WithdrawConflictOut}},
+)
+def post_withdraw(
+    batch_id: str,
+    fail: bool = Query(
+        default=False, description="演示用：在全部写入之后、提交之前注入异常以验证整批回滚。"
+    ),
+):
+    """撤回一个只更正了已有测点坐标的成功批次。
+
+    * 恢复为该批次提交前的原坐标，并按恢复后的坐标重算**当前**引用这些点的
+      全部路段（含此后由其他批次新建/改引用的路段），同一事务持久化。
+    * 任一记录测点此后被其他批次更正、删除或重建 → 整批 **409**，数据不变。
+      其他批次新增路段、改变路段引用、改动未记录测点均不妨碍撤回。
+    * 重复撤回返回首次结果（`already_withdrawn=true`），不再次修改数据。
+    * 不存在撤回记录 → **404**；写入中途失败整体回滚并保留原状态。
+    """
+    try:
+        result, _ = store.withdraw_batch(batch_id, inject_failure=fail)
+    except store.BatchNotWithdrawable as exc:
+        raise HTTPException(
+            status_code=404, detail=f"batch {exc.args[0]!r} has no rollback record"
+        ) from exc
+    except store.WithdrawConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "batch_id": exc.batch_id,
+                "conflicts": exc.conflicts,
+            },
+        )
+    except store.ConcurrentConflict as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except store.DemoFailure as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(status_code=503, detail=f"database busy: {exc}") from exc
+    return result
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/rollback", response_model=RollbackRecordOut
+)
+def get_rollback(batch_id: str):
+    """查看批次的原坐标记录与当前是否仍可撤回（用于运营侧排查）。"""
+    with read_tx() as conn:
+        record = store.get_rollback(conn, batch_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail=f"batch {batch_id!r} has no rollback record"
+        )
+    return record
 
 
 @app.get("/api/v1/state", response_model=StateResponse)

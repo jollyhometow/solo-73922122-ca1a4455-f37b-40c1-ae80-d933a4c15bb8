@@ -248,3 +248,168 @@ def test_state_endpoint_is_consistent_under_writes(apis):
         stop.set()
         t.join(timeout=20)
     assert not failures, failures
+
+
+def test_withdraw_via_other_process_updates_all_roads(apis):
+    """A batch committed on A is withdrawn on B; A immediately sees the result."""
+    a, b = apis
+    prefix = "W1"
+    pts = [
+        {"id": f"{prefix}P1", "lon": 30.0, "lat": 40.0},
+        {"id": f"{prefix}P2", "lon": 31.0, "lat": 41.0},
+        {"id": f"{prefix}P3", "lon": 32.0, "lat": 42.0},
+    ]
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={
+            "points": pts,
+            "roads": [
+                {"id": f"{prefix}R1", "point_ids": [f"{prefix}P1", f"{prefix}P2"]},
+                {"id": f"{prefix}R2", "point_ids": [f"{prefix}P2", f"{prefix}P3"]},
+            ],
+        },
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={"points": [{"id": f"{prefix}P2", "lon": 39.5, "lat": 49.5}]},
+        timeout=10,
+    )
+    assert r.status_code == 201, r.text
+    bid = r.json()["batch_id"]
+    assert r.json()["withdrawable"] is True
+
+    # A road created through A *after* the correction must also be recomputed.
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={"roads": [{"id": f"{prefix}R3", "point_ids": [f"{prefix}P3", f"{prefix}P2"]}]},
+        timeout=10,
+    )
+    assert r.status_code == 201
+    assert httpx.get(a + f"/api/v1/roads/{prefix}R3", timeout=10).json()["geometry"][
+        "coordinates"
+    ][1] == [39.5, 49.5]
+
+    w = httpx.post(b + f"/api/v1/batches/{bid}/withdraw", timeout=10)
+    assert w.status_code == 200, w.text
+    body = w.json()
+    assert body["affected_road_ids"] == [f"{prefix}R1", f"{prefix}R2", f"{prefix}R3"]
+
+    state = httpx.get(a + "/api/v1/state", timeout=10).json()
+    coords = {p["id"]: [p["lon"], p["lat"]] for p in state["points"]}
+    assert coords[f"{prefix}P2"] == [31.0, 41.0]
+    for road in state["roads"]:
+        if not road["id"].startswith(prefix):
+            continue
+        for pid, pos in zip(road["point_ids"], road["geometry"]["coordinates"]):
+            assert pos == coords[pid], f"{road['id']}/{pid} stale after withdrawal"
+
+
+def test_withdraw_races_a_correction_without_lost_update(apis):
+    """Withdrawal on one process, correction of the same point on the other.
+
+    Exactly one of the following must hold afterwards:
+    * the withdrawal won first and the later correction then makes it 409 on a
+      retry, or
+    * the correction won first and the withdrawal is refused with 409.
+    Either way the point must never end up at a value that disagrees with the
+    persisted geometry, and a 409 must leave the correction intact.
+    """
+    a, b = apis
+    prefix = "WR"
+    pts = [{"id": f"{prefix}P1", "lon": 50.0, "lat": 60.0},
+           {"id": f"{prefix}P2", "lon": 51.0, "lat": 61.0}]
+    httpx.post(
+        a + "/api/v1/batches",
+        json={"points": pts, "roads": [{"id": f"{prefix}R", "point_ids": [f"{prefix}P1", f"{prefix}P2"]}]},
+        timeout=10,
+    )
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={"points": [{"id": f"{prefix}P1", "lon": 55.0, "lat": 65.0}]},
+        timeout=10,
+    )
+    bid = r.json()["batch_id"]
+
+    barrier = threading.Barrier(2)
+    results: dict[str, httpx.Response] = {}
+
+    def do_withdraw():
+        barrier.wait()
+        results["withdraw"] = httpx.post(
+            a + f"/api/v1/batches/{bid}/withdraw", timeout=30
+        )
+
+    def do_correct():
+        barrier.wait()
+        results["correct"] = httpx.post(
+            b + "/api/v1/batches",
+            json={"points": [{"id": f"{prefix}P1", "lon": 57.0, "lat": 67.0}]},
+            timeout=30,
+        )
+
+    threads = [threading.Thread(target=do_withdraw), threading.Thread(target=do_correct)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=40)
+
+    assert results["correct"].status_code == 201, results["correct"].text
+    assert results["withdraw"].status_code in (200, 409), results["withdraw"].text
+
+    state = httpx.get(a + "/api/v1/state", timeout=10).json()
+    coords = {p["id"]: [p["lon"], p["lat"]] for p in state["points"]}
+    road = next(r for r in state["roads"] if r["id"] == f"{prefix}R")
+    assert road["geometry"]["coordinates"][0] == coords[f"{prefix}P1"]
+
+    if results["withdraw"].status_code == 409:
+        # The correction was applied first and must not have been rolled back.
+        assert coords[f"{prefix}P1"] == [55.0, 65.0] or coords[f"{prefix}P1"] == [57.0, 67.0]
+
+
+def test_concurrent_double_withdrawal_modifies_once(apis):
+    a, b = apis
+    prefix = "WD"
+    httpx.post(
+        a + "/api/v1/batches",
+        json={
+            "points": [{"id": f"{prefix}P1", "lon": 70.0, "lat": 80.0},
+                       {"id": f"{prefix}P2", "lon": 71.0, "lat": 81.0}],
+            "roads": [{"id": f"{prefix}R", "point_ids": [f"{prefix}P1", f"{prefix}P2"]}],
+        },
+        timeout=10,
+    )
+    r = httpx.post(
+        a + "/api/v1/batches",
+        json={"points": [{"id": f"{prefix}P1", "lon": 75.0, "lat": 85.0}]},
+        timeout=10,
+    )
+    bid = r.json()["batch_id"]
+
+    barrier = threading.Barrier(2)
+    results: dict[str, httpx.Response] = {}
+
+    def call(name, base):
+        barrier.wait()
+        results[name] = httpx.post(base + f"/api/v1/batches/{bid}/withdraw", timeout=30)
+
+    threads = [threading.Thread(target=call, args=("a", a)),
+               threading.Thread(target=call, args=("b", b))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=40)
+
+    assert results["a"].status_code == 200, results["a"].text
+    assert results["b"].status_code == 200, results["b"].text
+    restored = [r.json() for r in results.values() if not r.json()["already_withdrawn"]]
+    replays = [r.json() for r in results.values() if r.json()["already_withdrawn"]]
+    assert len(restored) == 1 and len(replays) == 1, results
+    assert restored[0]["points_restored"] == 1
+    assert replays[0]["points_restored"] == 0
+
+    road = httpx.get(b + f"/api/v1/roads/{prefix}R", timeout=10).json()
+    assert road["geometry"]["coordinates"][0] == [70.0, 80.0]
+    assert road["revision"] == 3  # create -> correction -> one withdrawal

@@ -10,7 +10,11 @@ a black-box acceptance check of the delivered environment:
 5. a deliberately paused batch on A (assembly outside any write lock) runs
    while B keeps ingesting and repointing roads;
 6. a failed batch rolls back; the final state is then re-read from B, and
-   snapshots are validated against the persisted values.
+   snapshots are validated against the persisted values;
+7. a mistyped coordinate-correction batch is withdrawn: original coordinates
+   are restored, every currently referencing road is recomputed (including a
+   road created after the correction), a repeat withdrawal is a no-op, and a
+   batch whose point was corrected again afterwards is refused with 409.
 
 Run locally::
 
@@ -54,6 +58,11 @@ class Api:
 
     def road(self, road_id: str) -> dict:
         r = self.http.get(f"/api/v1/roads/{road_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def withdraw(self, batch_id: str, **params):
+        r = self.http.post(f"/api/v1/batches/{batch_id}/withdraw", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -162,20 +171,96 @@ def _run(args) -> None:
     assert after == before, "failed batch leaked changes"
     pretty("回滚后状态与失败前完全一致", {"generation": after["generation"]})
 
-    # consistency check on the whole snapshot
-    coords = {p["id"]: [p["lon"], p["lat"]] for p in after["points"]}
-    for road in after["roads"]:
+    # -- 7 --------------------------------------------------------------
+    # A data-entry clerk mistypes a batch of point coordinates.  The batch
+    # response carries the batch id; a later batch adds a road that references
+    # one of the corrected points, and another corrects an unrelated point.
+    print("\n=== 7. 误更正测点坐标后整批撤回 " + "=" * 40)
+    good = {p["id"]: (p["lon"], p["lat"]) for p in b.state()["points"]}
+    mistyped = a.batch(
+        {
+            "points": [
+                {"id": "PT-001", "lon": 116.397999, "lat": 39.909999},
+                {"id": "PT-002", "lon": 116.407999, "lat": 39.913999},
+            ]
+        }
+    )
+    pretty(
+        "7a. 误更正批次的响应里带 batch_id 与 withdrawable（原坐标已记录）",
+        {
+            "batch_id": mistyped["batch_id"],
+            "withdrawable": mistyped["withdrawable"],
+            "affected_road_ids": mistyped["affected_road_ids"],
+        },
+    )
+    assert mistyped["withdrawable"] is True
+    batch_id = mistyped["batch_id"]
+
+    # Meanwhile the maintenance system adds a road that references a mistyped
+    # point and corrects an unrelated one: neither may block the withdrawal.
+    a.batch({"roads": [{"id": "RD-106", "point_ids": ["PT-001", "PT-005"]}]})
+    a.batch({"points": [{"id": "PT-005", "lon": 116.437900, "lat": 39.926500}]})
+    record = b.http.get(f"/api/v1/batches/{batch_id}/rollback").json()
+    pretty("7b. 撤回记录：保存的原坐标 + 当前值（仍可撤回）", record)
+
+    withdrawn = b.withdraw(batch_id)
+    pretty(
+        "7c. API B 撤回：恢复原坐标，并重算当前引用这些点的全部路段",
+        {
+            "points_restored": withdrawn["points_restored"],
+            "affected_road_ids": withdrawn["affected_road_ids"],
+            "roads": {
+                r["id"]: r["geometry"]["coordinates"] if r["geometry"] else "incomplete"
+                for r in withdrawn["roads"]
+            },
+        },
+    )
+    restored = {p["id"]: (p["lon"], p["lat"]) for p in a.state()["points"]}
+    assert restored["PT-001"] == good["PT-001"]
+    assert restored["PT-002"] == good["PT-002"]
+    assert "RD-106" in withdrawn["affected_road_ids"], "road added later was not recomputed"
+
+    again = b.withdraw(batch_id)
+    pretty(
+        "7d. 重复撤回：不再修改数据，返回首次结果",
+        {
+            "already_withdrawn": again["already_withdrawn"],
+            "points_restored": again["points_restored"],
+            "withdrawn_at": again["withdrawn_at"],
+        },
+    )
+    assert again["already_withdrawn"] is True and again["points_restored"] == 0
+
+    # A conflicting later correction makes the batch un-withdrawable, whole.
+    conflict_batch = a.batch(
+        {"points": [{"id": "PT-002", "lon": 116.400000, "lat": 39.900000}]}
+    )
+    conflict_id = conflict_batch["batch_id"]
+    a.batch({"points": [{"id": "PT-002", "lon": 116.407428, "lat": 39.913000}]})
+    before_conflict = b.state()
+    resp = a.http.post(f"/api/v1/batches/{conflict_id}/withdraw")
+    pretty(
+        "7e. 该点此后又被更正（即使改回原值）：整批 409，数据不变",
+        {"status": resp.status_code, "body": resp.json()},
+    )
+    assert resp.status_code == 409
+    assert b.state() == before_conflict
+
+    # consistency check on the whole snapshot (after the withdrawal step)
+    final = b.state()
+    coords = {p["id"]: [p["lon"], p["lat"]] for p in final["points"]}
+    for road in final["roads"]:
         for pid, pos in zip(road["point_ids"], road["geometry"]["coordinates"]):
             assert pos == coords[pid], f"{road['id']} geometry does not match point {pid}"
 
     pretty(
         "最终一致性校验通过：每条线形的每个坐标都等于同一快照里的测点原值",
         {
-            "generation": after["generation"],
-            "points": len(after["points"]),
+            "generation": final["generation"],
+            "points": len(final["points"]),
             "roads": {
                 r["id"]: ("ok" if r["status"] == "ok" else f"缺 {r['missing_point_ids']}")
-                for r in after["roads"]
+                for r in final["roads"]
             },
         },
     )
